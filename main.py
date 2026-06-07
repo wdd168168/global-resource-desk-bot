@@ -397,6 +397,34 @@ def build_order_reply(order_id, data):
 <a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
 
 
+def build_admin_notice(order_id, order):
+    fields = order.get("fields", {})
+
+    username = order.get("username")
+    username_text = f"@{username}" if username else "无用户名"
+
+    return f"""🔔 新需求待确认
+
+订单号：{order_id}
+
+来源群：{order.get("chat_title")}
+客户：{order.get("customer_name")} / {username_text}
+
+📌 需求概览
+地区：{fields.get("region")}
+渠道：{fields.get("platform")}
+性别：{fields.get("gender")}
+年龄分布：{fields.get("age")}
+数据量：{fields.get("quantity")}
+状态：{fields.get("active")}
+
+请尽快确认金额或处理方式。
+
+快捷指令：
+/price {order_id} 41
+/approve {order_id}"""
+
+
 def should_trigger_order(text, parsed, has_pending):
     if has_pending and recognized_count(parsed) > 0:
         return True
@@ -516,6 +544,15 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode="HTML",
             disable_web_page_preview=True
         )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=build_admin_notice(order_id, orders[order_id])
+            )
+        except Exception as e:
+            print(f"Admin notice failed: {e}")
+
         return
 
     faq_reply = get_faq_reply(text)
