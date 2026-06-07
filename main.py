@@ -4,9 +4,10 @@ import json
 import threading
 from html import escape
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from flask import Flask
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
@@ -32,6 +33,10 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 
+def now_cambodia():
+    return datetime.now(ZoneInfo("Asia/Phnom_Penh")).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def load_json(file_path):
     if not os.path.exists(file_path):
         return {}
@@ -48,7 +53,7 @@ def save_json(file_path, data):
 
 
 def generate_order_id():
-    return "GD" + datetime.now().strftime("%Y%m%d%H%M%S")
+    return "GD" + datetime.now(ZoneInfo("Asia/Phnom_Penh")).strftime("%Y%m%d%H%M%S")
 
 
 REGION_LIST = [
@@ -349,6 +354,19 @@ def format_missing_fields(fields):
     return "、".join(FIELD_NAMES[field] for field in fields)
 
 
+def build_boss_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🌐 联系 BOSS @{BOSS_USERNAME}", url=BOSS_LINK)]
+    ])
+
+
+def build_order_keyboard(order_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ 确认需求", callback_data=f"confirm_order:{order_id}")],
+        [InlineKeyboardButton(f"🌐 联系 BOSS @{BOSS_USERNAME}", url=BOSS_LINK)]
+    ])
+
+
 def build_pending_reply(data):
     missing = missing_fields(data)
 
@@ -369,16 +387,19 @@ def build_pending_reply(data):
 
 请直接补充缺少条件，系统会自动合并生成完整需求单。
 
-更多需求请直接联系我的 BOSS：
-<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+更多需求请点击下方按钮联系我的 BOSS。"""
 
 
 def build_order_reply(order_id, data):
-    return f"""✅ 需求已受理
+    return f"""🌐 <b>Global Resource Desk｜全球资源中心</b>
+
+✅ <b>需求单已生成，请再次确认相关信息</b>
+确认完成后，将同步下一步处理安排。
 
 订单号：<b>{escape(order_id)}</b>
 
-📌 需求概览
+📊 <b>需求参数</b>
+时间：{escape(now_cambodia())}（柬埔寨时间）
 地区：{escape(str(data.get("region")))}
 渠道：{escape(str(data.get("platform")))}
 性别：{escape(str(data.get("gender")))}
@@ -386,24 +407,43 @@ def build_order_reply(order_id, data):
 数据量：{escape(str(data.get("quantity")))}
 状态：{escape(str(data.get("active")))}
 
-📍 当前状态
-需求已完成登记，等待管理员确认。
-
-管理员确认后，将根据以上条件进入处理流程。
-
-如需修改条件，请直接补充说明。
-
-更多需求请直接联系我的 BOSS：
-<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+请核对以上信息，确认无误后点击下方按钮。"""
 
 
-def build_admin_notice(order_id, order):
+def build_confirmed_reply(order_id, data):
+    return f"""🌐 <b>Global Resource Desk｜全球资源中心</b>
+
+✅ <b>需求已确认</b>
+
+订单号：<b>{escape(order_id)}</b>
+
+📊 <b>需求参数</b>
+时间：{escape(now_cambodia())}（柬埔寨时间）
+地区：{escape(str(data.get("region")))}
+渠道：{escape(str(data.get("platform")))}
+性别：{escape(str(data.get("gender")))}
+年龄分布：{escape(str(data.get("age")))}
+数据量：{escape(str(data.get("quantity")))}
+状态：{escape(str(data.get("active")))}
+
+⏳ <b>订单状态</b>
+系统已确认本次需求，后台正在进行人工确认...
+
+请勿重复提交相同需求，避免生成重复订单。
+
+如需调整地区、渠道、数量或状态，请直接补充说明。
+
+更多需求请点击下方按钮联系我的 BOSS。"""
+
+
+def build_admin_notice(order_id, order, confirmed=False):
     fields = order.get("fields", {})
 
     username = order.get("username")
     username_text = f"@{username}" if username else "无用户名"
+    title = "✅ 客户已确认需求" if confirmed else "🔔 新需求待客户确认"
 
-    return f"""🔔 新需求待确认
+    return f"""{title}
 
 订单号：{order_id}
 
@@ -417,8 +457,6 @@ def build_admin_notice(order_id, order):
 年龄分布：{fields.get("age")}
 数据量：{fields.get("quantity")}
 状态：{fields.get("active")}
-
-请尽快确认金额或处理方式。
 
 快捷指令：
 /price {order_id} 41
@@ -471,6 +509,48 @@ async def cancel_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("当前没有未完成需求。")
 
 
+async def confirm_order_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    order_id = data.replace("confirm_order:", "", 1).strip()
+
+    orders = load_json(ORDERS_FILE)
+    if order_id not in orders:
+        await query.answer("订单不存在或已失效。", show_alert=True)
+        return
+
+    order = orders[order_id]
+    if query.from_user.id != order.get("user_id"):
+        await query.answer("只有提交该需求的客户可以确认。", show_alert=True)
+        return
+
+    if order.get("status") == "customer_confirmed_pending_admin":
+        await query.answer("该需求已经确认过了。", show_alert=True)
+        return
+
+    order["status"] = "customer_confirmed_pending_admin"
+    order["customer_confirmed_at"] = now_cambodia()
+    orders[order_id] = order
+    save_json(ORDERS_FILE, orders)
+
+    await query.edit_message_text(
+        text=build_confirmed_reply(order_id, order.get("fields", {})),
+        parse_mode="HTML",
+        reply_markup=build_boss_keyboard(),
+        disable_web_page_preview=True
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=build_admin_notice(order_id, order, confirmed=True)
+        )
+    except Exception as e:
+        print(f"Admin confirmed notice failed: {e}")
+
+
 async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -506,13 +586,14 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 "username": user.username,
                 "customer_name": user.full_name,
                 "fields": merged,
-                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "updated_at": now_cambodia()
             }
             save_json(PENDING_FILE, pending)
 
             await message.reply_text(
                 build_pending_reply(merged),
                 parse_mode="HTML",
+                reply_markup=build_boss_keyboard(),
                 disable_web_page_preview=True
             )
             return
@@ -529,8 +610,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
             "customer_name": user.full_name,
             "fields": merged,
             "raw_text": text,
-            "status": "pending_admin_confirm",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "status": "waiting_customer_confirm",
+            "created_at": now_cambodia()
         }
 
         save_json(ORDERS_FILE, orders)
@@ -542,13 +623,14 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text(
             build_order_reply(order_id, merged),
             parse_mode="HTML",
+            reply_markup=build_order_keyboard(order_id),
             disable_web_page_preview=True
         )
 
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=build_admin_notice(order_id, orders[order_id])
+                text=build_admin_notice(order_id, orders[order_id], confirmed=False)
             )
         except Exception as e:
             print(f"Admin notice failed: {e}")
@@ -560,6 +642,7 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text(
             faq_reply,
             parse_mode="HTML",
+            reply_markup=build_boss_keyboard(),
             disable_web_page_preview=True
         )
         return
@@ -608,7 +691,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     orders[order_id]["status"] = "confirmed_processing"
-    orders[order_id]["confirmed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    orders[order_id]["confirmed_at"] = now_cambodia()
     save_json(ORDERS_FILE, orders)
 
     chat_id = orders[order_id]["chat_id"]
@@ -647,7 +730,7 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     orders[order_id]["status"] = "waiting_payment"
     orders[order_id]["payment_amount"] = amount
     orders[order_id]["payment_currency"] = "USDT"
-    orders[order_id]["payment_created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    orders[order_id]["payment_created_at"] = now_cambodia()
     save_json(ORDERS_FILE, orders)
 
     chat_id = orders[order_id]["chat_id"]
@@ -665,8 +748,7 @@ USDT-TRC20 收款地址：
 
 付款后请发送 TXID 或转账截图，管理员会核对到账状态。
 
-更多需求请直接联系我的 BOSS：
-<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+更多需求请点击下方按钮联系我的 BOSS。"""
 
     if os.path.exists(PAYMENT_IMAGE):
         with open(PAYMENT_IMAGE, "rb") as photo:
@@ -674,13 +756,15 @@ USDT-TRC20 收款地址：
                 chat_id=chat_id,
                 photo=photo,
                 caption=caption,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=build_boss_keyboard()
             )
     else:
         await context.bot.send_message(
             chat_id=chat_id,
             text=caption,
             parse_mode="HTML",
+            reply_markup=build_boss_keyboard(),
             disable_web_page_preview=True
         )
 
@@ -736,18 +820,18 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 感谢您的支持与信任。
 
-更多需求请直接联系我的 BOSS：
-<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+更多需求请点击下方按钮联系我的 BOSS。"""
 
     await context.bot.send_document(
         chat_id=chat_id,
         document=document.file_id,
         caption=caption,
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=build_boss_keyboard()
     )
 
     orders[order_id]["status"] = "delivered"
-    orders[order_id]["delivered_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    orders[order_id]["delivered_at"] = now_cambodia()
     save_json(ORDERS_FILE, orders)
 
     context.user_data.pop("deliver_order_id", None)
@@ -773,6 +857,7 @@ def main():
     application.add_handler(CommandHandler("approve", approve))
     application.add_handler(CommandHandler("price", price))
     application.add_handler(CommandHandler("deliver", deliver_command))
+    application.add_handler(CallbackQueryHandler(confirm_order_callback, pattern=r"^confirm_order:"))
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, group_message_handler))
 
