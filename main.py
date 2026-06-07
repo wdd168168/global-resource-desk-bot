@@ -14,6 +14,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ORDERS_FILE = "orders.json"
 PENDING_FILE = "pending_requests.json"
 
+BOSS_USERNAME = "LOVE_Wl_YOU"
+BOSS_LINK = f"https://t.me/{BOSS_USERNAME}"
+
 app = Flask(__name__)
 
 
@@ -71,13 +74,79 @@ PLATFORM_PATTERNS = [
     ("YouTube", r"youtube|yt|油管"),
 ]
 
-PROJECT_PATTERNS = [
-    ("广告投放", r"广告|投放|推广|获客|引流|曝光|转化"),
-    ("市场调研", r"调研|市场研究|问卷|样本|分析|报告"),
-    ("社群运营", r"社群|群运营|群管理|社区|私域"),
-    ("内容分发", r"素材|内容|帖子|视频|图文|发布"),
-    ("品牌曝光", r"品牌|曝光|声量|知名度"),
-    ("客户支持", r"客服|售后|咨询|支持"),
+FAQ_RULES = [
+    {
+        "patterns": ["怎么下单", "如何下单", "怎么提交", "下单格式", "格式"],
+        "reply": """🧾 提交需求很简单
+
+直接在群里发送需求即可。
+
+示例：
+美国 TG 男 25-45 3天活跃 3K
+
+系统会自动识别条件，缺什么我会追问。
+格式清楚，推进就快。格式太飘，我也得先把它拽回来。"""
+    },
+    {
+        "patterns": ["多久", "多长时间", "什么时候", "交付时间", "处理时间"],
+        "reply": """⏱️ 处理时间取决于地区、渠道、条件和数据量。
+
+条件越细，整理时间越长。
+需求越清楚，推进越快。
+
+一句话总结：别让模糊需求浪费你的预算。"""
+    },
+    {
+        "patterns": ["支持什么平台", "支持哪些平台", "有哪些平台", "平台", "渠道"],
+        "reply": """📌 常见渠道：
+
+Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
+
+其他渠道也可以直接发需求。
+我能识别就登记，识别不了就提醒你补充。"""
+    },
+    {
+        "patterns": ["支持哪些地区", "什么地区", "哪些国家", "国家", "地区"],
+        "reply": """🌍 支持全球地区需求登记。
+
+示例：
+美国 / 德国 / 日本 / 柬埔寨 / 迪拜 / 东南亚 / 欧美 / 全球
+
+你负责说目标，我负责把需求整理清楚。"""
+    },
+    {
+        "patterns": ["价格", "报价", "多少钱", "费用", "怎么算"],
+        "reply": """💰 报价需要先看完整条件。
+
+请补充：
+地区
+渠道
+性别
+年龄
+状态
+数据量
+
+条件越完整，报价越准确。
+猜价格这种事，听起来刺激，做起来容易扯皮。"""
+    },
+    {
+        "patterns": ["老板在吗", "人在吗", "有人吗", "客服在吗", "管理员在吗"],
+        "reply": f"""在。
+
+机器人在，管理员也会看。
+
+你可以直接发需求，我先帮你整理。
+更多需求请联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+    },
+    {
+        "patterns": ["联系老板", "联系boss", "boss", "老板", "管理员"],
+        "reply": f"""更多需求请直接联系我的 BOSS：
+
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>
+
+你也可以直接在群里发需求，我会先帮你整理。"""
+    },
 ]
 
 
@@ -89,7 +158,12 @@ def detect_region(text):
     label_match = re.search(r"(地区|国家|市场|区域)\s*[:：]?\s*([A-Za-z\u4e00-\u9fa5\s]{2,40})", text, re.I)
     if label_match:
         raw = clean_text(label_match.group(2))
-        raw = re.sub(r"(TG|Telegram|电报|WhatsApp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube).*", "", raw, flags=re.I)
+        raw = re.sub(
+            r"(TG|Telegram|电报|WhatsApp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube).*",
+            "",
+            raw,
+            flags=re.I
+        )
         raw = clean_text(raw)
         if raw:
             return raw
@@ -117,30 +191,19 @@ def detect_platform(text):
     return None
 
 
-def detect_project_type(text):
-    for name, pattern in PROJECT_PATTERNS:
-        if re.search(pattern, text, re.I):
-            return name
+def detect_gender(text):
+    if re.search(r"男女|混合|不限|全部|所有|all", text, re.I):
+        return "不限"
+    if re.search(r"男性|男用户|男粉|男\b|male|men", text, re.I):
+        return "男"
+    if re.search(r"女性|女用户|女粉|女\b|female|women", text, re.I):
+        return "女"
+    if re.search(r"同性", text):
+        return "同性"
     return None
 
 
-def detect_audience(text):
-    if re.search(r"男性|男用户|男\b|male|men", text, re.I):
-        return "男性用户"
-    if re.search(r"女性|女用户|女\b|female|women", text, re.I):
-        return "女性用户"
-    if re.search(r"不限|混合|全部|所有|all", text, re.I):
-        return "不限/混合"
-    if re.search(r"商家|店主|电商|卖家", text):
-        return "电商/商家人群"
-    if re.search(r"本地|当地|local", text, re.I):
-        return "本地目标人群"
-    if re.search(r"高净值|投资|老板|企业主|B2B|b2b", text, re.I):
-        return "商业/高价值人群"
-    return None
-
-
-def detect_age_or_profile(text):
+def detect_age(text):
     range_match = re.search(r"(\d{2})\s*[-~到至]\s*(\d{2})\s*岁?", text)
     if range_match:
         return f"{range_match.group(1)}-{range_match.group(2)}"
@@ -149,7 +212,7 @@ def detect_age_or_profile(text):
     if plus_match:
         return f"{plus_match.group(1)}+"
 
-    label_match = re.search(r"(年龄|受众年龄|人群年龄)\s*[:：]?\s*(\d{2})\s*(\+|岁以上|以上)?", text)
+    label_match = re.search(r"(年龄|年龄分布|受众年龄|人群年龄)\s*[:：]?\s*(\d{2})\s*(\+|岁以上|以上)?", text)
     if label_match:
         suffix = "+" if label_match.group(3) else ""
         return f"{label_match.group(2)}{suffix}"
@@ -157,29 +220,37 @@ def detect_age_or_profile(text):
     return None
 
 
-def detect_period(text):
-    if re.search(r"当天|当日|今日", text):
-        return "当天"
-    if re.search(r"一周|7天|七天", text):
-        return "7天"
-    if re.search(r"半个月|15天|十五天", text):
-        return "15天"
-    if re.search(r"一个月|30天|三十天", text):
-        return "30天"
+def detect_active(text):
+    text = text.strip()
 
-    range_match = re.search(r"(\d{1,2})\s*[-~到至]\s*(\d{1,2})\s*(天|日)", text)
-    if range_match:
-        return f"{range_match.group(1)}-{range_match.group(2)}天"
+    if re.search(r"当日活跃|当天活跃|今日活跃|当天|今日|当日", text):
+        return "1天活跃"
 
-    day_match = re.search(r"(\d{1,2})\s*(天|日)", text)
-    if day_match:
-        return f"{day_match.group(1)}天"
+    random_range = re.search(r"(\d{1,2})\s*[-~到至]\s*(\d{1,2})\s*(天|日)\s*(随机)?", text)
+    if random_range:
+        suffix = "随机" if random_range.group(4) else ""
+        return f"{random_range.group(1)}-{random_range.group(2)}天活跃{suffix}"
+
+    near_match = re.search(r"(近|最近)?\s*(\d{1,2})\s*(天|日)(内)?\s*(活跃)?", text)
+    if near_match:
+        return f"{near_match.group(2)}天活跃"
+
+    active_match = re.search(r"活跃\s*(\d{1,2})\s*(天|日)", text)
+    if active_match:
+        return f"{active_match.group(1)}天活跃"
+
+    status_match = re.search(r"(状态)\s*[:：]?\s*(.+)", text)
+    if status_match:
+        raw = clean_text(status_match.group(2))
+        if raw:
+            return raw[:30]
 
     return None
 
 
-def normalize_scale(raw):
-    raw = raw.replace(",", "").replace(" ", "")
+def normalize_quantity(raw):
+    raw = raw.replace(",", "").replace("，", "").replace(" ", "")
+
     match_k = re.match(r"(\d+(?:\.\d+)?)[kK]", raw)
     if match_k:
         num = float(match_k.group(1))
@@ -202,22 +273,25 @@ def normalize_scale(raw):
     return raw
 
 
-def detect_scale(text):
-    budget_match = re.search(r"(预算|金额|费用)\s*[:：]?\s*([$¥]?\s*\d+(?:\.\d+)?\s*(?:美金|美元|人民币|U|u|USD|usd)?)", text)
-    if budget_match:
-        return clean_text(budget_match.group(2))
+def detect_quantity(text):
+    label_match = re.search(
+        r"(数据量|数量|需求量|规模|条数|样本)\s*[:：]?\s*(\d+(?:\.\d+)?\s*(?:[kK]|w|W|万|千)?|\d{3,})\s*(条|个|份|人|组)?",
+        text
+    )
+    if label_match:
+        return normalize_quantity(label_match.group(2))
 
-    scale_match = re.search(r"(规模|数量|样本|需求量)\s*[:：]?\s*(\d+(?:\.\d+)?\s*(?:[kK]|w|W|万|千)?|\d{3,})\s*(份|个|条|人|组)?", text)
-    if scale_match:
-        return normalize_scale(scale_match.group(2))
-
-    unit_match = re.search(r"(\d+(?:\.\d+)?\s*(?:[kK]|w|W|万|千))\s*(份|个|条|人|组)?", text)
+    unit_match = re.search(r"(\d+(?:\.\d+)?\s*(?:[kK]|w|W|万|千))\s*(条|个|份|人|组)?", text)
     if unit_match:
-        return normalize_scale(unit_match.group(1))
+        return normalize_quantity(unit_match.group(1))
 
-    big_number_match = re.search(r"\b(\d{4,6})\b\s*(份|个|条|人|组)?", text)
+    big_number_match = re.search(r"\b(\d{4,6})\b\s*(条|个|份|人|组)?", text)
     if big_number_match:
-        return normalize_scale(big_number_match.group(1))
+        return normalize_quantity(big_number_match.group(1))
+
+    comma_number_match = re.search(r"(\d{1,3}(?:,\d{3})+)\s*(条|个|份|人|组)?", text)
+    if comma_number_match:
+        return normalize_quantity(comma_number_match.group(1))
 
     return None
 
@@ -226,35 +300,23 @@ def parse_request_text(text):
     return {
         "region": detect_region(text),
         "platform": detect_platform(text),
-        "project_type": detect_project_type(text),
-        "audience": detect_audience(text),
-        "age_or_profile": detect_age_or_profile(text),
-        "period": detect_period(text),
-        "scale": detect_scale(text),
+        "gender": detect_gender(text),
+        "age": detect_age(text),
+        "quantity": detect_quantity(text),
+        "active": detect_active(text),
     }
 
 
 FIELD_NAMES = {
-    "region": "目标地区",
-    "platform": "投放/服务平台",
-    "project_type": "项目类型",
-    "audience": "目标人群",
-    "age_or_profile": "年龄/画像",
-    "period": "执行周期",
-    "scale": "预算/规模",
+    "region": "地区",
+    "platform": "渠道",
+    "gender": "性别",
+    "age": "年龄分布",
+    "quantity": "数据量",
+    "active": "状态",
 }
 
-FIELD_EXAMPLES = {
-    "region": "美国 / 迪拜 / 柬埔寨 / 日本 / 全球任意国家",
-    "platform": "Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram",
-    "project_type": "广告投放 / 市场调研 / 社群运营 / 内容分发",
-    "audience": "男 / 女 / 不限 / 本地用户 / 电商商家 / 企业主",
-    "age_or_profile": "25-45 / 30-55 / 商家 / 本地人群 / 高价值客户",
-    "period": "1天 / 3天 / 7天 / 30天",
-    "scale": "预算500U / 样本300 / 规模3K / 数量10000",
-}
-
-REQUIRED_FIELDS = ["region", "platform", "project_type", "audience", "period", "scale"]
+REQUIRED_FIELDS = ["region", "platform", "gender", "age", "quantity", "active"]
 
 
 def merge_fields(old_data, new_data):
@@ -275,7 +337,7 @@ def recognized_count(data):
 
 def format_current_fields(data):
     lines = []
-    for key in ["region", "platform", "project_type", "audience", "age_or_profile", "period", "scale"]:
+    for key in REQUIRED_FIELDS:
         if data.get(key):
             lines.append(f"{FIELD_NAMES[key]}：{escape(str(data[key]))}")
     return "\n".join(lines) if lines else "暂无"
@@ -297,15 +359,16 @@ def build_pending_reply(data):
 {escape(format_missing_fields(missing))}
 
 📍 填写参考：
-目标地区：美国 / 迪拜 / 柬埔寨 / 日本 / 全球任意国家
-平台渠道：Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
-项目类型：广告投放 / 市场调研 / 社群运营 / 内容分发
-目标人群：男 / 女 / 不限 / 本地用户 / 电商商家 / 企业主
-年龄画像：25-45 / 30-55 / 商家 / 本地人群 / 高价值客户
-执行周期：1天 / 3天 / 7天 / 30天
-预算规模：预算500U / 样本300 / 规模3K / 数量10000
+渠道：Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
+性别：男 / 女 / 不限
+年龄分布：25-45 / 30-55 / 25-80
+数据量：2,000 条 / 3K / 10K
+状态：1天活跃 / 3天活跃 / 7天活跃 / 30天活跃
 
-请直接补充缺少条件，系统会自动合并生成完整需求单。"""
+请直接补充缺少条件，系统会自动合并生成完整需求单。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
 
 
 def build_order_reply(order_id, data):
@@ -314,20 +377,22 @@ def build_order_reply(order_id, data):
 订单号：<b>{escape(order_id)}</b>
 
 📌 需求概览
-目标地区：{escape(str(data.get("region")))}
-平台渠道：{escape(str(data.get("platform")))}
-项目类型：{escape(str(data.get("project_type")))}
-目标人群：{escape(str(data.get("audience")))}
-年龄画像：{escape(str(data.get("age_or_profile") or "未指定"))}
-执行周期：{escape(str(data.get("period")))}
-预算规模：{escape(str(data.get("scale")))}
+地区：{escape(str(data.get("region")))}
+渠道：{escape(str(data.get("platform")))}
+性别：{escape(str(data.get("gender")))}
+年龄分布：{escape(str(data.get("age")))}
+数据量：{escape(str(data.get("quantity")))}
+状态：{escape(str(data.get("active")))}
 
 📍 当前状态
 需求已完成登记，等待管理员确认。
 
 管理员确认后，将根据以上条件进入处理流程。
 
-如需修改条件，请直接补充说明。"""
+如需修改条件，请直接补充说明。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
 
 
 def should_trigger_order(text, parsed, has_pending):
@@ -335,90 +400,17 @@ def should_trigger_order(text, parsed, has_pending):
         return True
 
     trigger_words = [
-        "地区", "国家", "市场", "平台", "预算", "规模", "数量", "周期",
-        "广告", "投放", "推广", "调研", "样本", "报告", "社群", "运营",
+        "地区", "国家", "市场", "区域", "渠道", "平台", "数量", "数据量", "需求量", "规模",
+        "年龄", "年龄分布", "活跃", "状态",
         "TG", "telegram", "电报", "whatsapp", "facebook", "fb",
         "instagram", "ig", "tiktok", "tk", "line", "zalo",
-        "男", "女", "男性", "女性", "本地", "商家"
+        "男", "女", "男性", "女性", "不限", "同性"
     ]
 
     if any(word.lower() in text.lower() for word in trigger_words):
         return recognized_count(parsed) >= 2
 
     return recognized_count(parsed) >= 3
-
-
-FAQ_RULES = [
-    {
-        "patterns": ["怎么下单", "如何下单", "怎么提交", "下单格式", "格式"],
-        "reply": """🧾 下单格式很简单
-
-直接在群里发送需求即可。
-
-示例：
-美国 Telegram 广告投放 男性用户 7天 预算500U
-
-系统会自动识别条件，缺什么我会追问。放心，我不挑食，但我挑格式。"""
-    },
-    {
-        "patterns": ["多久", "多长时间", "什么时候", "交付时间"],
-        "reply": """⏱️ 时间取决于地区、平台、项目类型和规模。
-
-条件越细，处理时间越长。
-需求越清楚，推进越快。
-
-模糊需求会消耗时间，清晰需求会节省预算。"""
-    },
-    {
-        "patterns": ["支持什么平台", "支持哪些平台", "有哪些平台", "平台"],
-        "reply": """📌 当前支持的常见平台：
-
-Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram / Google / YouTube
-
-其他平台也可以直接发需求，我会自动识别，识别不了就提醒你补充。"""
-    },
-    {
-        "patterns": ["支持哪些地区", "什么地区", "哪些国家", "国家"],
-        "reply": """🌍 支持全球地区需求登记。
-
-示例：
-美国 / 德国 / 日本 / 柬埔寨 / 迪拜 / 东南亚 / 欧美 / 全球
-
-你负责说目标，我负责把需求整理清楚。"""
-    },
-    {
-        "patterns": ["保效果", "保证效果", "转化率", "回复率", "成交率"],
-        "reply": """📌 结果说明
-
-项目执行会按确认条件处理，但不承诺具体转化结果。
-
-最终效果受预算、素材、账号状态、执行时间、话术、市场环境等因素影响。
-
-我能帮你把需求登记清楚，效果还得靠执行别掉链子。"""
-    },
-    {
-        "patterns": ["老板在吗", "人在吗", "有人吗", "客服在吗"],
-        "reply": """在。
-
-机器人在，管理员也会看。
-
-你直接发需求，我先帮你整理。别让一个“在吗”耽误一单生意。"""
-    },
-    {
-        "patterns": ["价格", "报价", "多少钱", "费用"],
-        "reply": """💰 报价需要先看完整条件。
-
-请补充：
-目标地区
-平台渠道
-项目类型
-目标人群
-执行周期
-预算或规模
-
-条件越完整，报价越准确。猜价格这种事，我不建议你信。"""
-    },
-]
 
 
 def get_faq_reply(text):
@@ -433,7 +425,7 @@ def get_faq_reply(text):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Global Resource Desk 全球资源中心已启动。\n\n"
-        "群内发送广告投放、市场调研或服务需求后，我会自动整理需求并追问缺失信息。"
+        "群内发送需求后，我会自动整理并追问缺失信息。"
     )
 
 
@@ -490,7 +482,8 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
             await message.reply_text(
                 build_pending_reply(merged),
-                parse_mode="HTML"
+                parse_mode="HTML",
+                disable_web_page_preview=True
             )
             return
 
@@ -518,13 +511,18 @@ async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
 
         await message.reply_text(
             build_order_reply(order_id, merged),
-            parse_mode="HTML"
+            parse_mode="HTML",
+            disable_web_page_preview=True
         )
         return
 
     faq_reply = get_faq_reply(text)
     if faq_reply:
-        await message.reply_text(faq_reply)
+        await message.reply_text(
+            faq_reply,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
         return
 
 
@@ -545,9 +543,11 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"群：{order.get('chat_title')}\n"
             f"状态：{order.get('status')}\n"
             f"地区：{fields.get('region')}\n"
-            f"平台：{fields.get('platform')}\n"
-            f"项目：{fields.get('project_type')}\n"
-            f"规模：{fields.get('scale')}\n"
+            f"渠道：{fields.get('platform')}\n"
+            f"性别：{fields.get('gender')}\n"
+            f"年龄：{fields.get('age')}\n"
+            f"数据量：{fields.get('quantity')}\n"
+            f"状态：{fields.get('active')}\n"
         )
 
     await update.message.reply_text("\n----------------\n".join(lines))
@@ -580,7 +580,7 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 订单号：{order_id}
 
-管理员已确认需求，项目进入处理流程。
+管理员已确认需求，当前已进入处理流程。
 
 感谢信任，后续进度会在本群同步。"""
     )
@@ -631,16 +631,20 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📌 交付说明
 
-本次交付以确认后的项目需求为准。
+本次交付以确认后的需求条件为准。
 
 如对文件内容存在疑问，请于交付后24小时内联系管理员反馈处理，超出时限不予受理。
 
-感谢您的支持与信任。"""
+感谢您的支持与信任。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
 
     await context.bot.send_document(
         chat_id=chat_id,
         document=document.file_id,
-        caption=caption
+        caption=caption,
+        parse_mode="HTML"
     )
 
     orders[order_id]["status"] = "delivered"
