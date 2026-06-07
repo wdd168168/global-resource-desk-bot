@@ -1,405 +1,784 @@
 import os
-import logging
-import time
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    filters,
-    ContextTypes,
-)
+import re
+import json
+import threading
+from html import escape
+from datetime import datetime
+from flask import Flask
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ============ 配置 ============
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+USDT_ADDRESS = os.getenv("USDT_ADDRESS", "请联系管理员获取收款地址")
+
+ORDERS_FILE = "orders.json"
+PENDING_FILE = "pending_requests.json"
+PAYMENT_IMAGE = os.getenv("PAYMENT_IMAGE", "payment.jpg")
+
 BOSS_USERNAME = "LOVE_Wl_YOU"
-BOSS_LINK = "https://t.me/LOVE_Wl_YOU"
-USDT_ADDRESS = os.environ.get("USDT_ADDRESS", "请设置USDT_ADDRESS环境变量")
+BOSS_LINK = f"https://t.me/{BOSS_USERNAME}"
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# ============ 定价表 ============
-# key: (地区, 平台, 性别, 年龄段, 活跃状态) -> 单价(RMB)
-PRICE_TABLE = {
-    ("德国", "TG", "男", "30+", "3天活跃"): 0.28,
-    ("德国", "TG", "女", "30+", "3天活跃"): 0.32,
-    ("德国", "TG", "男", "18-29", "3天活跃"): 0.30,
-    ("德国", "TG", "女", "18-29", "3天活跃"): 0.35,
-    ("德国", "WS", "男", "30+", "3天活跃"): 0.35,
-    ("德国", "WS", "女", "30+", "3天活跃"): 0.40,
-    ("美国", "TG", "男", "30+", "3天活跃"): 0.22,
-    ("美国", "TG", "女", "30+", "3天活跃"): 0.26,
-    ("英国", "TG", "男", "30+", "3天活跃"): 0.25,
-    ("日本", "LINE", "男", "30+", "7天活跃"): 0.45,
-    # 按需追加...
-}
-
-# 选项列表
-REGIONS = ["德国", "美国", "英国", "日本", "韩国", "东南亚", "全球混合"]
-PLATFORMS = ["TG", "WS", "LINE", "Facebook", "Instagram", "Twitter"]
-GENDERS = ["男", "女", "混合"]
-AGE_RANGES = ["18-29", "30+", "40+", "不限"]
-ACTIVITY_LEVELS = ["3天活跃", "7天活跃", "30天活跃", "不限"]
-
-# 会话状态
-(
-    SELECT_REGION,
-    SELECT_PLATFORM,
-    SELECT_GENDER,
-    SELECT_AGE,
-    SELECT_ACTIVITY,
-    INPUT_QUANTITY,
-    CONFIRM_ORDER,
-) = range(7)
+app = Flask(__name__)
 
 
-# ============ OKX 汇率 ============
-def get_usdt_cny_rate() -> float:
-    """从OKX获取USDT/CNY实时汇率"""
+@app.route("/")
+def home():
+    return "Global Resource Desk Bot is running."
+
+
+def run_web():
+    port = int(os.getenv("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+
+def load_json(file_path):
+    if not os.path.exists(file_path):
+        return {}
     try:
-        url = "https://www.okx.com/v3/c2c/otc-ticker/quotedPrice"
-        params = {
-            "baseCurrency": "USDT",
-            "quoteCurrency": "CNY",
-            "side": "sell",
-        }
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
-        data = resp.json()
-        if data.get("code") == 0 and data.get("data"):
-            price = float(data["data"].get("bestOption", {}).get("price", 0))
-            if price > 0:
-                return price
-    except Exception as e:
-        logger.warning(f"OKX汇率获取失败: {e}")
-
-    # 备用：OKX市场行情API
-    try:
-        url2 = "https://www.okx.com/api/v5/market/ticker?instId=USDT-CNY"
-        resp2 = requests.get(url2, headers=headers, timeout=10)
-        data2 = resp2.json()
-        if data2.get("data"):
-            return float(data2["data"][0]["last"])
-    except Exception as e:
-        logger.warning(f"OKX备用汇率获取失败: {e}")
-
-    return 7.25  # 兜底汇率
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 
-def rmb_to_usdt(rmb_amount: float) -> tuple:
-    """RMB转USDT，返回 (usdt金额, 汇率)"""
-    rate = get_usdt_cny_rate()
-    usdt = round(rmb_amount / rate, 2)
-    return usdt, rate
+def save_json(file_path, data):
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-# ============ 键盘生成 ============
-def build_keyboard(options: list, prefix: str, cols: int = 3) -> InlineKeyboardMarkup:
-    buttons = [
-        InlineKeyboardButton(text=opt, callback_data=f"{prefix}:{opt}")
-        for opt in options
-    ]
-    rows = [buttons[i : i + cols] for i in range(0, len(buttons), cols)]
-    return InlineKeyboardMarkup(rows)
+def generate_order_id():
+    return "GD" + datetime.now().strftime("%Y%m%d%H%M%S")
 
 
-# ============ 命令处理 ============
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "欢迎使用数据自动报价机器人\n\n"
-        "发送 /order 开始下单\n"
-        "发送 /price 查看价格表\n"
-        f"人工客服: {BOSS_LINK}\n\n"
-        "支持地区: 德国/美国/英国/日本/韩国/东南亚\n"
-        "支持平台: TG/WS/LINE/FB/IG/Twitter"
-    )
-    await update.message.reply_text(text)
+REGION_LIST = [
+    "美国", "德国", "英国", "法国", "意大利", "西班牙", "葡萄牙", "荷兰", "比利时", "瑞士",
+    "奥地利", "瑞典", "挪威", "丹麦", "芬兰", "波兰", "捷克", "希腊", "土耳其", "俄罗斯",
+    "加拿大", "澳大利亚", "新西兰", "巴西", "墨西哥", "阿根廷", "智利", "哥伦比亚",
+    "日本", "韩国", "泰国", "越南", "菲律宾", "马来西亚", "新加坡", "印尼", "印度",
+    "阿联酋", "迪拜", "沙特", "卡塔尔", "科威特", "以色列", "南非", "尼日利亚",
+    "柬埔寨", "老挝", "缅甸", "全球", "欧美", "东南亚", "中东", "拉美", "欧洲", "亚洲",
+    "USA", "US", "United States", "Germany", "UK", "United Kingdom", "France", "Italy",
+    "Spain", "Canada", "Australia", "Brazil", "Mexico", "Japan", "Korea", "Thailand",
+    "Vietnam", "Philippines", "Malaysia", "Singapore", "Indonesia", "India", "Global"
+]
+
+PLATFORM_PATTERNS = [
+    ("Telegram", r"(?<![A-Za-z])TG(?![A-Za-z])|telegram|电报"),
+    ("WhatsApp", r"whatsapp|whtasapp|(?<![A-Za-z])wa(?![A-Za-z])|(?<![A-Za-z])wpp(?![A-Za-z])|(?<![A-Za-z])ws(?![A-Za-z])"),
+    ("Facebook", r"facebook|(?<![A-Za-z])fb(?![A-Za-z])|脸书"),
+    ("Instagram", r"instagram|(?<![A-Za-z])ig(?![A-Za-z])|(?<![A-Za-z])ins(?![A-Za-z])"),
+    ("TikTok", r"tiktok|(?<![A-Za-z])tk(?![A-Za-z])|(?<![A-Za-z])tt(?![A-Za-z])|抖音国际"),
+    ("LINE", r"(?<![A-Za-z])line(?![A-Za-z])"),
+    ("Zalo", r"(?<![A-Za-z])zalo(?![A-Za-z])"),
+    ("X/Twitter", r"twitter|推特"),
+    ("Google", r"google|谷歌"),
+    ("YouTube", r"youtube|(?<![A-Za-z])yt(?![A-Za-z])|油管"),
+]
+
+FAQ_RULES = [
+    {
+        "patterns": ["怎么下单", "如何下单", "怎么提交", "下单格式", "格式"],
+        "reply": """🧾 提交需求很简单
+
+直接在群里发送需求即可。
+
+示例：
+美国 TG 男 25-45 3天活跃 3K
+
+系统会自动识别条件，缺什么我会追问。
+格式清楚，推进就快。格式太飘，我也得先把它拽回来。"""
+    },
+    {
+        "patterns": ["多久", "多长时间", "什么时候", "交付时间", "处理时间"],
+        "reply": """⏱️ 处理时间取决于地区、渠道、条件和数据量。
+
+条件越细，整理时间越长。
+需求越清楚，推进越快。
+
+一句话总结：别让模糊需求浪费你的预算。"""
+    },
+    {
+        "patterns": ["支持什么平台", "支持哪些平台", "有哪些平台", "平台", "渠道"],
+        "reply": """📌 常见渠道：
+
+Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
+
+其他渠道也可以直接发需求。
+我能识别就登记，识别不了就提醒你补充。"""
+    },
+    {
+        "patterns": ["支持哪些地区", "什么地区", "哪些国家", "国家", "地区"],
+        "reply": """🌍 支持全球地区需求登记。
+
+示例：
+美国 / 德国 / 日本 / 柬埔寨 / 迪拜 / 东南亚 / 欧美 / 全球
+
+你负责说目标，我负责把需求整理清楚。"""
+    },
+    {
+        "patterns": ["价格", "报价", "多少钱", "费用", "怎么算"],
+        "reply": """💰 报价需要先看完整条件。
+
+请补充：
+地区
+渠道
+性别
+年龄
+状态
+数据量
+
+条件越完整，报价越准确。
+猜价格这种事，听起来刺激，做起来容易扯皮。"""
+    },
+    {
+        "patterns": ["老板在吗", "人在吗", "有人吗", "客服在吗", "管理员在吗"],
+        "reply": f"""在。
+
+机器人在，管理员也会看。
+
+你可以直接发需求，我先帮你整理。
+更多需求请联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+    },
+    {
+        "patterns": ["联系老板", "联系boss", "boss", "老板", "管理员"],
+        "reply": f"""更多需求请直接联系我的 BOSS：
+
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>
+
+你也可以直接在群里发需求，我会先帮你整理。"""
+    },
+]
 
 
-async def price_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = ["当前价格表 (单位: RMB/条)\n"]
-    for key, price in PRICE_TABLE.items():
-        region, platform, gender, age, activity = key
-        lines.append(
-            f"  {region} | {platform} | {gender} | {age} | {activity} → ¥{price}"
+def clean_text(value):
+    return value.strip(" ：:，,。;；|/\n\t")
+
+
+def detect_region(text):
+    label_match = re.search(r"(地区|国家|市场|区域)\s*[:：]?\s*([A-Za-z\u4e00-\u9fa5\s]{2,40})", text, re.I)
+    if label_match:
+        raw = clean_text(label_match.group(2))
+        raw = re.sub(
+            r"(TG|Telegram|电报|WhatsApp|Whtasapp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube).*",
+            "",
+            raw,
+            flags=re.I
         )
-    lines.append(f"\n实时汇率通过OKX获取")
-    lines.append(f"人工咨询: {BOSS_LINK}")
-    await update.message.reply_text("\n".join(lines))
+        raw = clean_text(raw)
+        if raw:
+            return raw
 
+    platform_words = r"TG|Telegram|电报|WhatsApp|Whtasapp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube"
+    before_platform = re.search(rf"([A-Za-z\u4e00-\u9fa5\s]{{2,40}}?)\s*({platform_words})", text, re.I)
+    if before_platform:
+        raw = clean_text(before_platform.group(1))
+        raw = re.sub(r"^(要|需要|求|找|安排|做|地区|国家|市场|区域)", "", raw)
+        raw = clean_text(raw)
+        if raw:
+            return raw
 
-# ============ 下单会话流程 ============
-async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    kb = build_keyboard(REGIONS, "region")
-    await update.message.reply_text("【第1步】请选择地区:", reply_markup=kb)
-    return SELECT_REGION
+    for region in sorted(REGION_LIST, key=len, reverse=True):
+        if re.search(re.escape(region), text, re.I):
+            return region
 
-
-async def region_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    value = query.data.split(":", 1)[1]
-    context.user_data["region"] = value
-    kb = build_keyboard(PLATFORMS, "platform")
-    await query.edit_message_text(
-        f"地区: {value}\n\n【第2步】请选择平台:", reply_markup=kb
-    )
-    return SELECT_PLATFORM
-
-
-async def platform_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    value = query.data.split(":", 1)[1]
-    context.user_data["platform"] = value
-    kb = build_keyboard(GENDERS, "gender")
-    region = context.user_data["region"]
-    await query.edit_message_text(
-        f"地区: {region} | 平台: {value}\n\n【第3步】请选择性别:",
-        reply_markup=kb,
-    )
-    return SELECT_GENDER
-
-
-async def gender_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    value = query.data.split(":", 1)[1]
-    context.user_data["gender"] = value
-    kb = build_keyboard(AGE_RANGES, "age")
-    ud = context.user_data
-    await query.edit_message_text(
-        f"地区: {ud['region']} | 平台: {ud['platform']} | 性别: {value}\n\n"
-        f"【第4步】请选择年龄段:",
-        reply_markup=kb,
-    )
-    return SELECT_AGE
-
-
-async def age_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    value = query.data.split(":", 1)[1]
-    context.user_data["age"] = value
-    kb = build_keyboard(ACTIVITY_LEVELS, "activity")
-    ud = context.user_data
-    await query.edit_message_text(
-        f"地区: {ud['region']} | 平台: {ud['platform']} | "
-        f"性别: {ud['gender']} | 年龄: {value}\n\n"
-        f"【第5步】请选择活跃状态:",
-        reply_markup=kb,
-    )
-    return SELECT_ACTIVITY
-
-
-async def activity_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    value = query.data.split(":", 1)[1]
-    context.user_data["activity"] = value
-    ud = context.user_data
-    await query.edit_message_text(
-        f"地区: {ud['region']} | 平台: {ud['platform']} | "
-        f"性别: {ud['gender']} | 年龄: {ud['age']} | 活跃: {value}\n\n"
-        f"【第6步】请输入购买数量（纯数字）:"
-    )
-    return INPUT_QUANTITY
-
-
-async def quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit() or int(text) <= 0:
-        await update.message.reply_text("请输入有效的正整数数量:")
-        return INPUT_QUANTITY
-
-    qty = int(text)
-    context.user_data["quantity"] = qty
-    ud = context.user_data
-
-    # 查价
-    key = (ud["region"], ud["platform"], ud["gender"], ud["age"], ud["activity"])
-    unit_price = PRICE_TABLE.get(key)
-
-    if unit_price is None:
-        # 尝试模糊匹配或给默认价
-        unit_price = find_closest_price(key)
-
-    if unit_price is None:
-        await update.message.reply_text(
-            f"当前组合暂无定价，请联系人工客服: {BOSS_LINK}"
-        )
-        return ConversationHandler.END
-
-    total_rmb = round(unit_price * qty, 2)
-    usdt_amount, rate = rmb_to_usdt(total_rmb)
-    context.user_data["unit_price"] = unit_price
-    context.user_data["total_rmb"] = total_rmb
-    context.user_data["usdt_amount"] = usdt_amount
-    context.user_data["rate"] = rate
-
-    summary = (
-        "═══ 订单确认 ═══\n\n"
-        f"地区: {ud['region']}\n"
-        f"平台: {ud['platform']}\n"
-        f"性别: {ud['gender']}\n"
-        f"年龄: {ud['age']}\n"
-        f"活跃: {ud['activity']}\n"
-        f"数量: {qty} 条\n\n"
-        f"单价: ¥{unit_price}/条\n"
-        f"总价: ¥{total_rmb}\n"
-        f"汇率: {rate} (OKX实时)\n"
-        f"折合: {usdt_amount} USDT\n\n"
-        f"确认下单请点击下方按钮"
-    )
-
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("确认下单", callback_data="confirm:yes"),
-                InlineKeyboardButton("取消", callback_data="confirm:no"),
-            ]
-        ]
-    )
-    await update.message.reply_text(summary, reply_markup=kb)
-    return CONFIRM_ORDER
-
-
-async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    choice = query.data.split(":", 1)[1]
-
-    if choice == "no":
-        await query.edit_message_text("订单已取消。发送 /order 重新下单。")
-        return ConversationHandler.END
-
-    ud = context.user_data
-    order_id = f"ORD{int(time.time())}"
-
-    payment_msg = (
-        f"═══ 支付信息 ═══\n\n"
-        f"订单号: {order_id}\n"
-        f"应付: {ud['usdt_amount']} USDT\n\n"
-        f"收款网络: TRC20\n"
-        f"收款地址:\n{USDT_ADDRESS}\n\n"
-        f"付款后请将TxHash发送给客服确认\n"
-        f"客服: {BOSS_LINK}\n\n"
-        f"请在30分钟内完成付款，超时需重新下单"
-    )
-    await query.edit_message_text(payment_msg)
-
-    # 通知老板
-    try:
-        boss_msg = (
-            f"新订单 {order_id}\n"
-            f"地区:{ud['region']} 平台:{ud['platform']} "
-            f"性别:{ud['gender']} 年龄:{ud['age']} 活跃:{ud['activity']}\n"
-            f"数量:{ud['quantity']} 总价:¥{ud['total_rmb']} = {ud['usdt_amount']}U\n"
-            f"用户: @{query.from_user.username or query.from_user.id}"
-        )
-        # 如果知道boss的chat_id可以直接发
-        # await context.bot.send_message(chat_id=BOSS_CHAT_ID, text=boss_msg)
-        logger.info(boss_msg)
-    except Exception as e:
-        logger.error(f"通知老板失败: {e}")
-
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("已取消。发送 /order 重新开始。")
-    return ConversationHandler.END
-
-
-# ============ 模糊匹配 ============
-def find_closest_price(key: tuple) -> float | None:
-    """找最接近的定价，优先匹配地区+平台"""
-    region, platform, gender, age, activity = key
-    candidates = []
-    for k, v in PRICE_TABLE.items():
-        score = 0
-        if k[0] == region:
-            score += 10
-        if k[1] == platform:
-            score += 5
-        if k[2] == gender:
-            score += 2
-        if k[3] == age:
-            score += 2
-        if k[4] == activity:
-            score += 1
-        if score >= 15:  # 至少地区+平台匹配
-            candidates.append((score, v))
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1]
     return None
 
 
-# ============ 通用消息 ============
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    if any(kw in text for kw in ["价格", "报价", "多少钱", "price"]):
-        await price_list(update, context)
-    elif any(kw in text for kw in ["下单", "购买", "买", "order"]):
-        return await order_start(update, context)
-    else:
-        await update.message.reply_text(
-            f"发送 /order 自动报价下单\n发送 /price 查看价格表\n人工客服: {BOSS_LINK}"
-        )
+def detect_platform(text):
+    for name, pattern in PLATFORM_PATTERNS:
+        if re.search(pattern, text, re.I):
+            return name
+    return None
 
 
-# ============ 主函数 ============
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN 未设置")
-        return
+def detect_gender(text):
+    if re.search(r"男女|混合|不限|全部|所有|all", text, re.I):
+        return "不限"
+    if re.search(r"男性|男用户|男粉|男\b|male|men", text, re.I):
+        return "男"
+    if re.search(r"女性|女用户|女粉|女\b|female|women", text, re.I):
+        return "女"
+    if re.search(r"同性", text):
+        return "同性"
+    return None
 
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("order", order_start)],
-        states={
-            SELECT_REGION: [
-                CallbackQueryHandler(region_selected, pattern=r"^region:")
-            ],
-            SELECT_PLATFORM: [
-                CallbackQueryHandler(platform_selected, pattern=r"^platform:")
-            ],
-            SELECT_GENDER: [
-                CallbackQueryHandler(gender_selected, pattern=r"^gender:")
-            ],
-            SELECT_AGE: [
-                CallbackQueryHandler(age_selected, pattern=r"^age:")
-            ],
-            SELECT_ACTIVITY: [
-                CallbackQueryHandler(activity_selected, pattern=r"^activity:")
-            ],
-            INPUT_QUANTITY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, quantity_input)
-            ],
-            CONFIRM_ORDER: [
-                CallbackQueryHandler(order_confirm, pattern=r"^confirm:")
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
+def detect_age(text):
+    range_match = re.search(r"(\d{2})\s*[-~到至]\s*(\d{2})\s*岁?", text)
+    if range_match:
+        return f"{range_match.group(1)}-{range_match.group(2)}"
+
+    plus_match = re.search(r"(\d{2})\s*(\+|岁以上|以上)", text)
+    if plus_match:
+        return f"{plus_match.group(1)}+"
+
+    label_match = re.search(r"(年龄|年龄分布|受众年龄|人群年龄)\s*[:：]?\s*(\d{2})\s*(\+|岁以上|以上)?", text)
+    if label_match:
+        suffix = "+" if label_match.group(3) else ""
+        return f"{label_match.group(2)}{suffix}"
+
+    return None
+
+
+def detect_active(text):
+    text = text.strip()
+
+    if re.search(r"当日活跃|当天活跃|今日活跃|当天|今日|当日", text):
+        return "1天活跃"
+
+    random_range = re.search(r"(\d{1,2})\s*[-~到至]\s*(\d{1,2})\s*(天|日)\s*(随机)?", text)
+    if random_range:
+        suffix = "随机" if random_range.group(4) else ""
+        return f"{random_range.group(1)}-{random_range.group(2)}天活跃{suffix}"
+
+    near_match = re.search(r"(近|最近)?\s*(\d{1,2})\s*(天|日)(内)?\s*(活跃)?", text)
+    if near_match:
+        return f"{near_match.group(2)}天活跃"
+
+    active_match = re.search(r"活跃\s*(\d{1,2})\s*(天|日)", text)
+    if active_match:
+        return f"{active_match.group(1)}天活跃"
+
+    status_match = re.search(r"(状态)\s*[:：]?\s*(.+)", text)
+    if status_match:
+        raw = clean_text(status_match.group(2))
+        if raw:
+            return raw[:30]
+
+    return None
+
+
+def normalize_quantity(raw):
+    raw = raw.replace(",", "").replace("，", "").replace(" ", "")
+
+    match_k = re.match(r"(\d+(?:\.\d+)?)[kK]", raw)
+    if match_k:
+        num = float(match_k.group(1))
+        return f"{int(num)}K" if num.is_integer() else f"{num}K"
+
+    match_w = re.match(r"(\d+(?:\.\d+)?)(w|W|万)", raw)
+    if match_w:
+        num = float(match_w.group(1)) * 10000
+        return f"{int(num):,}"
+
+    match_qian = re.match(r"(\d+(?:\.\d+)?)(千)", raw)
+    if match_qian:
+        num = float(match_qian.group(1)) * 1000
+        return f"{int(num):,}"
+
+    digits = re.sub(r"\D", "", raw)
+    if digits:
+        return f"{int(digits):,}"
+
+    return raw
+
+
+def detect_quantity(text):
+    label_match = re.search(
+        r"(数据量|数量|需求量|规模|条数|样本)\s*[:：]?\s*(\d+(?:\.\d+)?\s*(?:[kK]|w|W|万|千)?|\d{3,})\s*(条|个|份|人|组)?",
+        text
+    )
+    if label_match:
+        return normalize_quantity(label_match.group(2))
+
+    comma_number_match = re.search(r"(\d{1,3}(?:,\d{3})+)\s*(条|个|份|人|组)?", text)
+    if comma_number_match:
+        return normalize_quantity(comma_number_match.group(1))
+
+    unit_match = re.search(r"(\d+(?:\.\d+)?\s*(?:[kK]|w|W|万|千))\s*(条|个|份|人|组)?", text)
+    if unit_match:
+        return normalize_quantity(unit_match.group(1))
+
+    big_number_match = re.search(r"\b(\d{4,6})\b\s*(条|个|份|人|组)?", text)
+    if big_number_match:
+        return normalize_quantity(big_number_match.group(1))
+
+    return None
+
+
+def parse_request_text(text):
+    return {
+        "region": detect_region(text),
+        "platform": detect_platform(text),
+        "gender": detect_gender(text),
+        "age": detect_age(text),
+        "quantity": detect_quantity(text),
+        "active": detect_active(text),
+    }
+
+
+FIELD_NAMES = {
+    "region": "地区",
+    "platform": "渠道",
+    "gender": "性别",
+    "age": "年龄分布",
+    "quantity": "数据量",
+    "active": "状态",
+}
+
+REQUIRED_FIELDS = ["region", "platform", "gender", "age", "quantity", "active"]
+
+
+def merge_fields(old_data, new_data):
+    merged = dict(old_data or {})
+    for key, value in new_data.items():
+        if value:
+            merged[key] = value
+    return merged
+
+
+def missing_fields(data):
+    return [field for field in REQUIRED_FIELDS if not data.get(field)]
+
+
+def recognized_count(data):
+    return sum(1 for value in data.values() if value)
+
+
+def format_current_fields(data):
+    lines = []
+    for key in REQUIRED_FIELDS:
+        if data.get(key):
+            lines.append(f"{FIELD_NAMES[key]}：{escape(str(data[key]))}")
+    return "\n".join(lines) if lines else "暂无"
+
+
+def format_missing_fields(fields):
+    return "、".join(FIELD_NAMES[field] for field in fields)
+
+
+def build_pending_reply(data):
+    missing = missing_fields(data)
+
+    return f"""📌 已识别到部分需求
+
+当前已识别：
+{format_current_fields(data)}
+
+还需补充：
+{escape(format_missing_fields(missing))}
+
+📍 填写参考：
+渠道：Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
+性别：男 / 女 / 不限
+年龄分布：25-45 / 30-55 / 25-80
+数据量：2,000 条 / 3K / 10K
+状态：1天活跃 / 3天活跃 / 7天活跃 / 30天活跃
+
+请直接补充缺少条件，系统会自动合并生成完整需求单。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+
+
+def build_order_reply(order_id, data):
+    return f"""✅ 需求已受理
+
+订单号：<b>{escape(order_id)}</b>
+
+📌 需求概览
+地区：{escape(str(data.get("region")))}
+渠道：{escape(str(data.get("platform")))}
+性别：{escape(str(data.get("gender")))}
+年龄分布：{escape(str(data.get("age")))}
+数据量：{escape(str(data.get("quantity")))}
+状态：{escape(str(data.get("active")))}
+
+📍 当前状态
+需求已完成登记，等待管理员确认。
+
+管理员确认后，将根据以上条件进入处理流程。
+
+如需修改条件，请直接补充说明。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+
+
+def build_admin_notice(order_id, order):
+    fields = order.get("fields", {})
+
+    username = order.get("username")
+    username_text = f"@{username}" if username else "无用户名"
+
+    return f"""🔔 新需求待确认
+
+订单号：{order_id}
+
+来源群：{order.get("chat_title")}
+客户：{order.get("customer_name")} / {username_text}
+
+📌 需求概览
+地区：{fields.get("region")}
+渠道：{fields.get("platform")}
+性别：{fields.get("gender")}
+年龄分布：{fields.get("age")}
+数据量：{fields.get("quantity")}
+状态：{fields.get("active")}
+
+请尽快确认金额或处理方式。
+
+快捷指令：
+/price {order_id} 41
+/approve {order_id}"""
+
+
+def should_trigger_order(text, parsed, has_pending):
+    if has_pending and recognized_count(parsed) > 0:
+        return True
+
+    trigger_words = [
+        "地区", "国家", "市场", "区域", "渠道", "平台", "数量", "数据量", "需求量", "规模",
+        "年龄", "年龄分布", "活跃", "状态",
+        "TG", "telegram", "电报", "whatsapp", "whtasapp", "facebook", "fb",
+        "instagram", "ig", "tiktok", "tk", "line", "zalo",
+        "男", "女", "男性", "女性", "不限", "同性"
+    ]
+
+    if any(word.lower() in text.lower() for word in trigger_words):
+        return recognized_count(parsed) >= 2
+
+    return recognized_count(parsed) >= 3
+
+
+def get_faq_reply(text):
+    lower = text.lower()
+    for rule in FAQ_RULES:
+        for pattern in rule["patterns"]:
+            if pattern.lower() in lower:
+                return rule["reply"]
+    return None
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Global Resource Desk 全球资源中心已启动。\n\n"
+        "群内发送需求后，我会自动整理并追问缺失信息。"
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("price", price_list))
-    app.add_handler(conv_handler)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot启动成功")
-    app.run_polling(drop_pending_updates=True)
+async def cancel_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = load_json(PENDING_FILE)
+    key = f"{update.effective_chat.id}:{update.effective_user.id}"
+
+    if key in pending:
+        pending.pop(key)
+        save_json(PENDING_FILE, pending)
+        await update.message.reply_text("当前未完成需求已取消。")
+    else:
+        await update.message.reply_text("当前没有未完成需求。")
+
+
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message or not message.text:
+        return
+
+    if message.from_user and message.from_user.is_bot:
+        return
+
+    text = message.text.strip()
+
+    if text.startswith("/"):
+        return
+
+    chat = message.chat
+    user = message.from_user
+
+    pending = load_json(PENDING_FILE)
+    pending_key = f"{chat.id}:{user.id}"
+
+    parsed = parse_request_text(text)
+    has_pending = pending_key in pending
+
+    if should_trigger_order(text, parsed, has_pending):
+        current_data = pending.get(pending_key, {}).get("fields", {})
+        merged = merge_fields(current_data, parsed)
+        missing = missing_fields(merged)
+
+        if missing:
+            pending[pending_key] = {
+                "chat_id": chat.id,
+                "chat_title": chat.title,
+                "user_id": user.id,
+                "username": user.username,
+                "customer_name": user.full_name,
+                "fields": merged,
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            save_json(PENDING_FILE, pending)
+
+            await message.reply_text(
+                build_pending_reply(merged),
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+            return
+
+        order_id = generate_order_id()
+        orders = load_json(ORDERS_FILE)
+
+        orders[order_id] = {
+            "order_id": order_id,
+            "chat_id": chat.id,
+            "chat_title": chat.title,
+            "user_id": user.id,
+            "username": user.username,
+            "customer_name": user.full_name,
+            "fields": merged,
+            "raw_text": text,
+            "status": "pending_admin_confirm",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        save_json(ORDERS_FILE, orders)
+
+        if pending_key in pending:
+            pending.pop(pending_key)
+            save_json(PENDING_FILE, pending)
+
+        await message.reply_text(
+            build_order_reply(order_id, merged),
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=build_admin_notice(order_id, orders[order_id])
+            )
+        except Exception as e:
+            print(f"Admin notice failed: {e}")
+
+        return
+
+    faq_reply = get_faq_reply(text)
+    if faq_reply:
+        await message.reply_text(
+            faq_reply,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+        return
+
+
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    orders = load_json(ORDERS_FILE)
+    if not orders:
+        await update.message.reply_text("当前没有需求单。")
+        return
+
+    lines = []
+    for order_id, order in list(orders.items())[-20:]:
+        fields = order.get("fields", {})
+        lines.append(
+            f"订单号：{order_id}\n"
+            f"群：{order.get('chat_title')}\n"
+            f"状态：{order.get('status')}\n"
+            f"地区：{fields.get('region')}\n"
+            f"渠道：{fields.get('platform')}\n"
+            f"性别：{fields.get('gender')}\n"
+            f"年龄：{fields.get('age')}\n"
+            f"数据量：{fields.get('quantity')}\n"
+            f"状态：{fields.get('active')}\n"
+        )
+
+    await update.message.reply_text("\n----------------\n".join(lines))
+
+
+async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text("格式错误：/approve 订单号")
+        return
+
+    order_id = context.args[0].strip()
+    orders = load_json(ORDERS_FILE)
+
+    if order_id not in orders:
+        await update.message.reply_text("没有找到这个订单号。")
+        return
+
+    orders[order_id]["status"] = "confirmed_processing"
+    orders[order_id]["confirmed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_json(ORDERS_FILE, orders)
+
+    chat_id = orders[order_id]["chat_id"]
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"""✅ 需求已确认
+
+订单号：{order_id}
+
+管理员已确认需求，当前已进入处理流程。
+
+感谢信任，后续进度会在本群同步。"""
+    )
+
+    await update.message.reply_text(f"已确认并通知群内：{order_id}")
+
+
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("格式错误：/price 订单号 金额\n例如：/price GD20260607050447 41")
+        return
+
+    order_id = context.args[0].strip()
+    amount = context.args[1].strip()
+
+    orders = load_json(ORDERS_FILE)
+
+    if order_id not in orders:
+        await update.message.reply_text("没有找到这个订单号。")
+        return
+
+    orders[order_id]["status"] = "waiting_payment"
+    orders[order_id]["payment_amount"] = amount
+    orders[order_id]["payment_currency"] = "USDT"
+    orders[order_id]["payment_created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_json(ORDERS_FILE, orders)
+
+    chat_id = orders[order_id]["chat_id"]
+
+    caption = f"""💳 付款信息已生成
+
+订单号：<b>{escape(order_id)}</b>
+
+应付金额：<b>{escape(amount)} USDT</b>
+
+USDT-TRC20 收款地址：
+<code>{escape(USDT_ADDRESS)}</code>
+
+请务必使用 TRC20 网络转账，其他网络可能无法核对。
+
+付款后请发送 TXID 或转账截图，管理员会核对到账状态。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+
+    if os.path.exists(PAYMENT_IMAGE):
+        with open(PAYMENT_IMAGE, "rb") as photo:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=caption,
+                parse_mode="HTML"
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+
+    await update.message.reply_text(f"付款信息已发送到群内：{order_id}，金额：{amount} USDT")
+
+
+async def deliver_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text("格式错误：/deliver 订单号\n然后再发送交付文件。")
+        return
+
+    order_id = context.args[0].strip()
+    orders = load_json(ORDERS_FILE)
+
+    if order_id not in orders:
+        await update.message.reply_text("没有找到这个订单号。")
+        return
+
+    context.user_data["deliver_order_id"] = order_id
+    await update.message.reply_text(f"已选择订单：{order_id}\n现在请发送交付文件。")
+
+
+async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    order_id = context.user_data.get("deliver_order_id")
+    if not order_id:
+        await update.message.reply_text("请先发送：/deliver 订单号")
+        return
+
+    orders = load_json(ORDERS_FILE)
+
+    if order_id not in orders:
+        await update.message.reply_text("订单不存在。")
+        return
+
+    chat_id = orders[order_id]["chat_id"]
+    document = update.message.document
+
+    caption = f"""✅ 订单 {order_id} 已完成交付
+
+📎 文件已上传，请及时查看。
+
+📌 交付说明
+
+本次交付以确认后的需求条件为准。
+
+如对文件内容存在疑问，请于交付后24小时内联系管理员反馈处理，超出时限不予受理。
+
+感谢您的支持与信任。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=document.file_id,
+        caption=caption,
+        parse_mode="HTML"
+    )
+
+    orders[order_id]["status"] = "delivered"
+    orders[order_id]["delivered_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_json(ORDERS_FILE, orders)
+
+    context.user_data.pop("deliver_order_id", None)
+
+    await update.message.reply_text(f"订单 {order_id} 已发送到对应群内。")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Error: {context.error}")
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("缺少 BOT_TOKEN 环境变量")
+
+    threading.Thread(target=run_web, daemon=True).start()
+
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("cancel", cancel_request))
+    application.add_handler(CommandHandler("orders", my_orders))
+    application.add_handler(CommandHandler("approve", approve))
+    application.add_handler(CommandHandler("price", price))
+    application.add_handler(CommandHandler("deliver", deliver_command))
+    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, group_message_handler))
+
+    application.add_error_handler(error_handler)
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
