@@ -2,6 +2,7 @@ import os
 import re
 import json
 import threading
+import requests
 from html import escape
 from datetime import datetime
 from flask import Flask
@@ -18,6 +19,23 @@ PAYMENT_IMAGE = os.getenv("PAYMENT_IMAGE", "payment.jpg")
 
 BOSS_USERNAME = "LOVE_Wl_YOU"
 BOSS_LINK = f"https://t.me/{BOSS_USERNAME}"
+
+# 定价表：(地区, 平台, 性别, 年龄, 活跃) -> 单价(RMB/条)
+# 目前只有一条规则，后续可扩展
+PRICING_RULES = [
+    {
+        "region": "德国",
+        "platform": "Telegram",
+        "gender": "男",
+        "age_min": 30,
+        "age_max": None,
+        "active": "3天活跃",
+        "unit_price_rmb": 0.28,
+    },
+]
+
+# 默认单价（如果没有匹配到定价规则，走管理员手动报价）
+DEFAULT_UNIT_PRICE = None
 
 app = Flask(__name__)
 
@@ -49,6 +67,164 @@ def save_json(file_path, data):
 
 def generate_order_id():
     return "GD" + datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def get_okx_usdt_cny_rate():
+    """从欧意OKX获取USDT/CNY实时汇率"""
+    try:
+        url = "https://www.okx.com/v3/c2c/otc-ticker/quotedPrice"
+        params = {
+            "baseCurrency": "USDT",
+            "quoteCurrency": "CNY",
+            "side": "sell",
+        }
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        data = resp.json()
+        if data.get("code") == 0 and data.get("data"):
+            price_str = data["data"].get("bestOption", {}).get("price")
+            if price_str:
+                return float(price_str)
+    except Exception:
+        pass
+
+    # 备用接口：OKX v5 ticker
+    try:
+        url2 = "https://www.okx.com/api/v5/market/index-tickers?instId=USDT-CNY"
+        headers2 = {"User-Agent": "Mozilla/5.0"}
+        resp2 = requests.get(url2, headers=headers2, timeout=10)
+        data2 = resp2.json()
+        if data2.get("code") == "0" and data2.get("data"):
+            idx_px = data2["data"][0].get("idxPx")
+            if idx_px:
+                return float(idx_px)
+    except Exception:
+        pass
+
+    # 第三备用：CoinGecko
+    try:
+        url3 = "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=cny"
+        resp3 = requests.get(url3, timeout=10)
+        data3 = resp3.json()
+        cny_price = data3.get("tether", {}).get("cny")
+        if cny_price:
+            return float(cny_price)
+    except Exception:
+        pass
+
+    return None
+
+
+def parse_age_value(age_str):
+    """将年龄字符串解析为 (min, max) 元组"""
+    if not age_str:
+        return None, None
+
+    range_match = re.match(r"(\d+)\s*[-~到至]\s*(\d+)", age_str)
+    if range_match:
+        return int(range_match.group(1)), int(range_match.group(2))
+
+    plus_match = re.match(r"(\d+)\+?$", age_str)
+    if plus_match:
+        return int(plus_match.group(1)), None
+
+    return None, None
+
+
+def match_pricing_rule(fields):
+    """根据订单字段匹配定价规则，返回单价(RMB)或None"""
+    region = (fields.get("region") or "").strip()
+    platform = (fields.get("platform") or "").strip()
+    gender = (fields.get("gender") or "").strip()
+    age_str = (fields.get("age") or "").strip()
+    active = (fields.get("active") or "").strip()
+
+    age_min, age_max = parse_age_value(age_str)
+
+    for rule in PRICING_RULES:
+        # 地区匹配
+        if rule["region"].lower() != region.lower() and rule["region"] != region:
+            # 也检查德国/Germany等别名
+            region_aliases = {
+                "德国": ["德国", "germany", "de"],
+                "美国": ["美国", "usa", "us", "united states"],
+                "英国": ["英国", "uk", "united kingdom"],
+                "法国": ["法国", "france"],
+                "日本": ["日本", "japan"],
+            }
+            matched_region = False
+            for canonical, aliases in region_aliases.items():
+                if rule["region"] == canonical and region.lower() in [a.lower() for a in aliases]:
+                    matched_region = True
+                    break
+            if not matched_region:
+                continue
+
+        # 平台匹配
+        if rule["platform"].lower() != platform.lower():
+            platform_aliases = {
+                "Telegram": ["telegram", "tg", "电报"],
+                "WhatsApp": ["whatsapp", "wa", "wpp", "ws"],
+                "Facebook": ["facebook", "fb", "脸书"],
+                "Instagram": ["instagram", "ig", "ins"],
+                "TikTok": ["tiktok", "tk", "tt"],
+                "LINE": ["line"],
+                "Zalo": ["zalo"],
+            }
+            matched_platform = False
+            for canonical, aliases in platform_aliases.items():
+                if rule["platform"] == canonical and platform.lower() in [a.lower() for a in aliases]:
+                    matched_platform = True
+                    break
+            if not matched_platform:
+                continue
+
+        # 性别匹配
+        if rule["gender"] != gender:
+            continue
+
+        # 年龄匹配
+        if age_min is not None:
+            if rule["age_min"] is not None and age_min < rule["age_min"]:
+                continue
+            if rule["age_max"] is not None and age_max is not None and age_max > rule["age_max"]:
+                continue
+        else:
+            if rule["age_min"] is not None:
+                continue
+
+        # 活跃状态匹配
+        if rule["active"] != active:
+            continue
+
+        return rule["unit_price_rmb"]
+
+    return DEFAULT_UNIT_PRICE
+
+
+def parse_quantity_to_number(qty_str):
+    """将数量字符串转为纯数字"""
+    if not qty_str:
+        return None
+
+    raw = qty_str.replace(",", "").replace("，", "").replace(" ", "")
+
+    match_k = re.match(r"(\d+(?:\.\d+)?)[kK]", raw)
+    if match_k:
+        return int(float(match_k.group(1)) * 1000)
+
+    match_w = re.match(r"(\d+(?:\.\d+)?)(w|W|万)", raw)
+    if match_w:
+        return int(float(match_w.group(1)) * 10000)
+
+    digits = re.sub(r"\D", "", raw)
+    if digits:
+        return int(digits)
+
+    return None
 
 
 REGION_LIST = [
@@ -84,10 +260,10 @@ FAQ_RULES = [
 直接在群里发送需求即可。
 
 示例：
-美国 TG 男 25-45 3天活跃 3K
+德国 TG 男 30+ 3天活跃 3K
 
-系统会自动识别条件，缺什么我会追问。
-格式清楚，推进就快。格式太飘，我也得先把它拽回来。"""
+系统会自动识别条件并计算价格。
+格式清楚，推进就快。"""
     },
     {
         "patterns": ["多久", "多长时间", "什么时候", "交付时间", "处理时间"],
@@ -118,18 +294,14 @@ Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
     },
     {
         "patterns": ["价格", "报价", "多少钱", "费用", "怎么算"],
-        "reply": """💰 报价需要先看完整条件。
+        "reply": """💰 系统自动报价。
 
-请补充：
-地区
-渠道
-性别
-年龄
-状态
-数据量
+请发送完整需求：
+地区 + 渠道 + 性别 + 年龄 + 状态 + 数据量
 
-条件越完整，报价越准确。
-猜价格这种事，听起来刺激，做起来容易扯皮。"""
+示例：德国 TG 男 30+ 3天活跃 5K
+
+系统会自动计算总价并换算为 USDT。"""
     },
     {
         "patterns": ["老板在吗", "人在吗", "有人吗", "客服在吗", "管理员在吗"],
@@ -137,7 +309,7 @@ Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
 
 机器人在，管理员也会看。
 
-你可以直接发需求，我先帮你整理。
+你可以直接发需求，系统自动报价。
 更多需求请联系我的 BOSS：
 <a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
     },
@@ -147,7 +319,7 @@ Telegram / WhatsApp / LINE / TikTok / Facebook / Instagram
 
 <a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>
 
-你也可以直接在群里发需求，我会先帮你整理。"""
+你也可以直接在群里发需求，系统会自动报价。"""
     },
 ]
 
@@ -367,14 +539,16 @@ def build_pending_reply(data):
 数据量：2,000 条 / 3K / 10K
 状态：1天活跃 / 3天活跃 / 7天活跃 / 30天活跃
 
-请直接补充缺少条件，系统会自动合并生成完整需求单。
+请直接补充缺少条件，系统会自动合并并计算价格。
 
 更多需求请直接联系我的 BOSS：
 <a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
 
 
-def build_order_reply(order_id, data):
-    return f"""✅ 需求已受理
+def build_order_reply_with_price(order_id, data, pricing_info):
+    """生成带自动报价的订单回复"""
+
+    base_text = f"""✅ 需求已受理
 
 订单号：<b>{escape(order_id)}</b>
 
@@ -384,402 +558,51 @@ def build_order_reply(order_id, data):
 性别：{escape(str(data.get("gender")))}
 年龄分布：{escape(str(data.get("age")))}
 数据量：{escape(str(data.get("quantity")))}
-状态：{escape(str(data.get("active")))}
+状态：{escape(str(data.get("active")))}"""
 
-📍 当前状态
-需求已完成登记，等待管理员确认。
+    if pricing_info:
+        price_text = f"""
 
-管理员确认后，将根据以上条件进入处理流程。
+💰 自动报价
+单价：{pricing_info['unit_price_rmb']} RMB / 条
+数量：{pricing_info['quantity_num']:,} 条
+总价（RMB）：¥{pricing_info['total_rmb']:.2f}
+欧意实时汇率：1 USDT ≈ {pricing_info['usdt_rate']:.2f} CNY
+总价（USDT）：<b>{pricing_info['total_usdt']:.2f} USDT</b>
 
-如需修改条件，请直接补充说明。
+💳 USDT-TRC20 收款地址：
+<code>{escape(USDT_ADDRESS)}</code>
+
+请使用 TRC20 网络转账，付款后发送 TXID 或转账截图。"""
+    else:
+        price_text = f"""
+
+💰 报价信息
+当前条件暂无自动定价规则，管理员将尽快确认报价。"""
+
+    footer = f"""
 
 更多需求请直接联系我的 BOSS：
 <a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
 
+    return base_text + price_text + footer
 
-def build_admin_notice(order_id, order):
+
+def build_admin_notice(order_id, order, pricing_info=None):
     fields = order.get("fields", {})
 
     username = order.get("username")
     username_text = f"@{username}" if username else "无用户名"
 
-    return f"""🔔 新需求待确认
-
-订单号：{order_id}
-
-来源群：{order.get("chat_title")}
-客户：{order.get("customer_name")} / {username_text}
-
-📌 需求概览
-地区：{fields.get("region")}
-渠道：{fields.get("platform")}
-性别：{fields.get("gender")}
-年龄分布：{fields.get("age")}
-数据量：{fields.get("quantity")}
-状态：{fields.get("active")}
-
-请尽快确认金额或处理方式。
-
-快捷指令：
-/price {order_id} 41
-/approve {order_id}"""
-
-
-def should_trigger_order(text, parsed, has_pending):
-    if has_pending and recognized_count(parsed) > 0:
-        return True
-
-    trigger_words = [
-        "地区", "国家", "市场", "区域", "渠道", "平台", "数量", "数据量", "需求量", "规模",
-        "年龄", "年龄分布", "活跃", "状态",
-        "TG", "telegram", "电报", "whatsapp", "whtasapp", "facebook", "fb",
-        "instagram", "ig", "tiktok", "tk", "line", "zalo",
-        "男", "女", "男性", "女性", "不限", "同性"
-    ]
-
-    if any(word.lower() in text.lower() for word in trigger_words):
-        return recognized_count(parsed) >= 2
-
-    return recognized_count(parsed) >= 3
-
-
-def get_faq_reply(text):
-    lower = text.lower()
-    for rule in FAQ_RULES:
-        for pattern in rule["patterns"]:
-            if pattern.lower() in lower:
-                return rule["reply"]
-    return None
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Global Resource Desk 全球资源中心已启动。\n\n"
-        "群内发送需求后，我会自动整理并追问缺失信息。"
-    )
-
-
-async def cancel_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pending = load_json(PENDING_FILE)
-    key = f"{update.effective_chat.id}:{update.effective_user.id}"
-
-    if key in pending:
-        pending.pop(key)
-        save_json(PENDING_FILE, pending)
-        await update.message.reply_text("当前未完成需求已取消。")
+    price_section = ""
+    if pricing_info:
+        price_section = f"""
+💰 自动报价结果
+单价：{pricing_info['unit_price_rmb']} RMB/条
+数量：{pricing_info['quantity_num']:,} 条
+总价 RMB：¥{pricing_info['total_rmb']:.2f}
+汇率：1 USDT ≈ {pricing_info['usdt_rate']:.2f} CNY
+总价 USDT：{pricing_info['total_usdt']:.2f} USDT
+"""
     else:
-        await update.message.reply_text("当前没有未完成需求。")
-
-
-async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.text:
-        return
-
-    if message.from_user and message.from_user.is_bot:
-        return
-
-    text = message.text.strip()
-
-    if text.startswith("/"):
-        return
-
-    chat = message.chat
-    user = message.from_user
-
-    pending = load_json(PENDING_FILE)
-    pending_key = f"{chat.id}:{user.id}"
-
-    parsed = parse_request_text(text)
-    has_pending = pending_key in pending
-
-    if should_trigger_order(text, parsed, has_pending):
-        current_data = pending.get(pending_key, {}).get("fields", {})
-        merged = merge_fields(current_data, parsed)
-        missing = missing_fields(merged)
-
-        if missing:
-            pending[pending_key] = {
-                "chat_id": chat.id,
-                "chat_title": chat.title,
-                "user_id": user.id,
-                "username": user.username,
-                "customer_name": user.full_name,
-                "fields": merged,
-                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            save_json(PENDING_FILE, pending)
-
-            await message.reply_text(
-                build_pending_reply(merged),
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            return
-
-        order_id = generate_order_id()
-        orders = load_json(ORDERS_FILE)
-
-        orders[order_id] = {
-            "order_id": order_id,
-            "chat_id": chat.id,
-            "chat_title": chat.title,
-            "user_id": user.id,
-            "username": user.username,
-            "customer_name": user.full_name,
-            "fields": merged,
-            "raw_text": text,
-            "status": "pending_admin_confirm",
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-        save_json(ORDERS_FILE, orders)
-
-        if pending_key in pending:
-            pending.pop(pending_key)
-            save_json(PENDING_FILE, pending)
-
-        await message.reply_text(
-            build_order_reply(order_id, merged),
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=build_admin_notice(order_id, orders[order_id])
-            )
-        except Exception as e:
-            print(f"Admin notice failed: {e}")
-
-        return
-
-    faq_reply = get_faq_reply(text)
-    if faq_reply:
-        await message.reply_text(
-            faq_reply,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-        return
-
-
-async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    orders = load_json(ORDERS_FILE)
-    if not orders:
-        await update.message.reply_text("当前没有需求单。")
-        return
-
-    lines = []
-    for order_id, order in list(orders.items())[-20:]:
-        fields = order.get("fields", {})
-        lines.append(
-            f"订单号：{order_id}\n"
-            f"群：{order.get('chat_title')}\n"
-            f"状态：{order.get('status')}\n"
-            f"地区：{fields.get('region')}\n"
-            f"渠道：{fields.get('platform')}\n"
-            f"性别：{fields.get('gender')}\n"
-            f"年龄：{fields.get('age')}\n"
-            f"数据量：{fields.get('quantity')}\n"
-            f"状态：{fields.get('active')}\n"
-        )
-
-    await update.message.reply_text("\n----------------\n".join(lines))
-
-
-async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if len(context.args) < 1:
-        await update.message.reply_text("格式错误：/approve 订单号")
-        return
-
-    order_id = context.args[0].strip()
-    orders = load_json(ORDERS_FILE)
-
-    if order_id not in orders:
-        await update.message.reply_text("没有找到这个订单号。")
-        return
-
-    orders[order_id]["status"] = "confirmed_processing"
-    orders[order_id]["confirmed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_json(ORDERS_FILE, orders)
-
-    chat_id = orders[order_id]["chat_id"]
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"""✅ 需求已确认
-
-订单号：{order_id}
-
-管理员已确认需求，当前已进入处理流程。
-
-感谢信任，后续进度会在本群同步。"""
-    )
-
-    await update.message.reply_text(f"已确认并通知群内：{order_id}")
-
-
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if len(context.args) < 2:
-        await update.message.reply_text("格式错误：/price 订单号 金额\n例如：/price GD20260607050447 41")
-        return
-
-    order_id = context.args[0].strip()
-    amount = context.args[1].strip()
-
-    orders = load_json(ORDERS_FILE)
-
-    if order_id not in orders:
-        await update.message.reply_text("没有找到这个订单号。")
-        return
-
-    orders[order_id]["status"] = "waiting_payment"
-    orders[order_id]["payment_amount"] = amount
-    orders[order_id]["payment_currency"] = "USDT"
-    orders[order_id]["payment_created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_json(ORDERS_FILE, orders)
-
-    chat_id = orders[order_id]["chat_id"]
-
-    caption = f"""💳 付款信息已生成
-
-订单号：<b>{escape(order_id)}</b>
-
-应付金额：<b>{escape(amount)} USDT</b>
-
-USDT-TRC20 收款地址：
-<code>{escape(USDT_ADDRESS)}</code>
-
-请务必使用 TRC20 网络转账，其他网络可能无法核对。
-
-付款后请发送 TXID 或转账截图，管理员会核对到账状态。
-
-更多需求请直接联系我的 BOSS：
-<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
-
-    if os.path.exists(PAYMENT_IMAGE):
-        with open(PAYMENT_IMAGE, "rb") as photo:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=caption,
-                parse_mode="HTML"
-            )
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            parse_mode="HTML",
-            disable_web_page_preview=True
-        )
-
-    await update.message.reply_text(f"付款信息已发送到群内：{order_id}，金额：{amount} USDT")
-
-
-async def deliver_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if len(context.args) < 1:
-        await update.message.reply_text("格式错误：/deliver 订单号\n然后再发送交付文件。")
-        return
-
-    order_id = context.args[0].strip()
-    orders = load_json(ORDERS_FILE)
-
-    if order_id not in orders:
-        await update.message.reply_text("没有找到这个订单号。")
-        return
-
-    context.user_data["deliver_order_id"] = order_id
-    await update.message.reply_text(f"已选择订单：{order_id}\n现在请发送交付文件。")
-
-
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    order_id = context.user_data.get("deliver_order_id")
-    if not order_id:
-        await update.message.reply_text("请先发送：/deliver 订单号")
-        return
-
-    orders = load_json(ORDERS_FILE)
-
-    if order_id not in orders:
-        await update.message.reply_text("订单不存在。")
-        return
-
-    chat_id = orders[order_id]["chat_id"]
-    document = update.message.document
-
-    caption = f"""✅ 订单 {order_id} 已完成交付
-
-📎 文件已上传，请及时查看。
-
-📌 交付说明
-
-本次交付以确认后的需求条件为准。
-
-如对文件内容存在疑问，请于交付后24小时内联系管理员反馈处理，超出时限不予受理。
-
-感谢您的支持与信任。
-
-更多需求请直接联系我的 BOSS：
-<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
-
-    await context.bot.send_document(
-        chat_id=chat_id,
-        document=document.file_id,
-        caption=caption,
-        parse_mode="HTML"
-    )
-
-    orders[order_id]["status"] = "delivered"
-    orders[order_id]["delivered_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_json(ORDERS_FILE, orders)
-
-    context.user_data.pop("deliver_order_id", None)
-
-    await update.message.reply_text(f"订单 {order_id} 已发送到对应群内。")
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Error: {context.error}")
-
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("缺少 BOT_TOKEN 环境变量")
-
-    threading.Thread(target=run_web, daemon=True).start()
-
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("cancel", cancel_request))
-    application.add_handler(CommandHandler("orders", my_orders))
-    application.add_handler(CommandHandler("approve", approve))
-    application.add_handler(CommandHandler("price", price))
-    application.add_handler(CommandHandler("deliver", deliver_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, group_message_handler))
-
-    application.add_error_handler(error_handler)
-
-    application.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+        price_section = "\n⚠️ 无自动定价规则，需手动报价。
