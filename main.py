@@ -10,9 +10,11 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+USDT_ADDRESS = os.getenv("USDT_ADDRESS", "请联系管理员获取收款地址")
 
 ORDERS_FILE = "orders.json"
 PENDING_FILE = "pending_requests.json"
+PAYMENT_IMAGE = os.getenv("PAYMENT_IMAGE", "payment.jpg")
 
 BOSS_USERNAME = "LOVE_Wl_YOU"
 BOSS_LINK = f"https://t.me/{BOSS_USERNAME}"
@@ -62,16 +64,16 @@ REGION_LIST = [
 ]
 
 PLATFORM_PATTERNS = [
-    ("Telegram", r"\bTG\b|telegram|电报"),
-    ("WhatsApp", r"whatsapp|\bwa\b|\bwpp\b|\bws\b"),
-    ("Facebook", r"facebook|\bfb\b|脸书"),
-    ("Instagram", r"instagram|\big\b|\bins\b"),
-    ("TikTok", r"tiktok|\btk\b|\btt\b|抖音国际"),
-    ("LINE", r"\bline\b|Line"),
-    ("Zalo", r"\bzalo\b"),
-    ("X/Twitter", r"twitter|\bx\b|推特"),
+    ("Telegram", r"(?<![A-Za-z])TG(?![A-Za-z])|telegram|电报"),
+    ("WhatsApp", r"whatsapp|whtasapp|(?<![A-Za-z])wa(?![A-Za-z])|(?<![A-Za-z])wpp(?![A-Za-z])|(?<![A-Za-z])ws(?![A-Za-z])"),
+    ("Facebook", r"facebook|(?<![A-Za-z])fb(?![A-Za-z])|脸书"),
+    ("Instagram", r"instagram|(?<![A-Za-z])ig(?![A-Za-z])|(?<![A-Za-z])ins(?![A-Za-z])"),
+    ("TikTok", r"tiktok|(?<![A-Za-z])tk(?![A-Za-z])|(?<![A-Za-z])tt(?![A-Za-z])|抖音国际"),
+    ("LINE", r"(?<![A-Za-z])line(?![A-Za-z])"),
+    ("Zalo", r"(?<![A-Za-z])zalo(?![A-Za-z])"),
+    ("X/Twitter", r"twitter|推特"),
     ("Google", r"google|谷歌"),
-    ("YouTube", r"youtube|yt|油管"),
+    ("YouTube", r"youtube|(?<![A-Za-z])yt(?![A-Za-z])|油管"),
 ]
 
 FAQ_RULES = [
@@ -159,7 +161,7 @@ def detect_region(text):
     if label_match:
         raw = clean_text(label_match.group(2))
         raw = re.sub(
-            r"(TG|Telegram|电报|WhatsApp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube).*",
+            r"(TG|Telegram|电报|WhatsApp|Whtasapp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube).*",
             "",
             raw,
             flags=re.I
@@ -168,7 +170,7 @@ def detect_region(text):
         if raw:
             return raw
 
-    platform_words = r"TG|Telegram|电报|WhatsApp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube"
+    platform_words = r"TG|Telegram|电报|WhatsApp|Whtasapp|WA|WPP|WS|Facebook|FB|IG|INS|Instagram|TikTok|TK|TT|LINE|Zalo|Google|YouTube"
     before_platform = re.search(rf"([A-Za-z\u4e00-\u9fa5\s]{{2,40}}?)\s*({platform_words})", text, re.I)
     if before_platform:
         raw = clean_text(before_platform.group(1))
@@ -281,6 +283,10 @@ def detect_quantity(text):
     if label_match:
         return normalize_quantity(label_match.group(2))
 
+    comma_number_match = re.search(r"(\d{1,3}(?:,\d{3})+)\s*(条|个|份|人|组)?", text)
+    if comma_number_match:
+        return normalize_quantity(comma_number_match.group(1))
+
     unit_match = re.search(r"(\d+(?:\.\d+)?\s*(?:[kK]|w|W|万|千))\s*(条|个|份|人|组)?", text)
     if unit_match:
         return normalize_quantity(unit_match.group(1))
@@ -288,10 +294,6 @@ def detect_quantity(text):
     big_number_match = re.search(r"\b(\d{4,6})\b\s*(条|个|份|人|组)?", text)
     if big_number_match:
         return normalize_quantity(big_number_match.group(1))
-
-    comma_number_match = re.search(r"(\d{1,3}(?:,\d{3})+)\s*(条|个|份|人|组)?", text)
-    if comma_number_match:
-        return normalize_quantity(comma_number_match.group(1))
 
     return None
 
@@ -402,7 +404,7 @@ def should_trigger_order(text, parsed, has_pending):
     trigger_words = [
         "地区", "国家", "市场", "区域", "渠道", "平台", "数量", "数据量", "需求量", "规模",
         "年龄", "年龄分布", "活跃", "状态",
-        "TG", "telegram", "电报", "whatsapp", "facebook", "fb",
+        "TG", "telegram", "电报", "whatsapp", "whtasapp", "facebook", "fb",
         "instagram", "ig", "tiktok", "tk", "line", "zalo",
         "男", "女", "男性", "女性", "不限", "同性"
     ]
@@ -588,6 +590,66 @@ async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"已确认并通知群内：{order_id}")
 
 
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text("格式错误：/price 订单号 金额\n例如：/price GD20260607050447 41")
+        return
+
+    order_id = context.args[0].strip()
+    amount = context.args[1].strip()
+
+    orders = load_json(ORDERS_FILE)
+
+    if order_id not in orders:
+        await update.message.reply_text("没有找到这个订单号。")
+        return
+
+    orders[order_id]["status"] = "waiting_payment"
+    orders[order_id]["payment_amount"] = amount
+    orders[order_id]["payment_currency"] = "USDT"
+    orders[order_id]["payment_created_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_json(ORDERS_FILE, orders)
+
+    chat_id = orders[order_id]["chat_id"]
+
+    caption = f"""💳 付款信息已生成
+
+订单号：<b>{escape(order_id)}</b>
+
+应付金额：<b>{escape(amount)} USDT</b>
+
+USDT-TRC20 收款地址：
+<code>{escape(USDT_ADDRESS)}</code>
+
+请务必使用 TRC20 网络转账，其他网络可能无法核对。
+
+付款后请发送 TXID 或转账截图，管理员会核对到账状态。
+
+更多需求请直接联系我的 BOSS：
+<a href="{BOSS_LINK}">@{BOSS_USERNAME}</a>"""
+
+    if os.path.exists(PAYMENT_IMAGE):
+        with open(PAYMENT_IMAGE, "rb") as photo:
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=caption,
+                parse_mode="HTML"
+            )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+
+    await update.message.reply_text(f"付款信息已发送到群内：{order_id}，金额：{amount} USDT")
+
+
 async def deliver_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -672,6 +734,7 @@ def main():
     application.add_handler(CommandHandler("cancel", cancel_request))
     application.add_handler(CommandHandler("orders", my_orders))
     application.add_handler(CommandHandler("approve", approve))
+    application.add_handler(CommandHandler("price", price))
     application.add_handler(CommandHandler("deliver", deliver_command))
     application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     application.add_handler(MessageHandler(filters.TEXT & filters.ChatType.GROUPS, group_message_handler))
